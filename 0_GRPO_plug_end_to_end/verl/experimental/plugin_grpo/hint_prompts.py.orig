@@ -1,0 +1,61 @@
+"""Prompts for three-slot search hints and unmodified-Host query generation."""
+
+from __future__ import annotations
+
+HINT_FIELDS = ("ENTITY", "RELATION", "DISAMBIGUATOR")
+
+
+def hint_field_system_prompt(field: str) -> str:
+    if field not in HINT_FIELDS:
+        raise ValueError(f"Unknown hint field: {field}")
+    descriptions = {
+        "ENTITY": (
+            "one exact entity, proper name, acronym, or number copied from the "
+            "question or failed-search history"
+        ),
+        "RELATION": "a short noun phrase naming the missing relation or attribute",
+        "DISAMBIGUATOR": "a new short qualifier not already present in ENTITY or RELATION",
+    }
+    return (
+        f"Generate only {descriptions[field]}. This is the {field} field of a three-field "
+        "search-direction hint. Output a short field only. Do not output a label, sentence, "
+        "explanation, quote, semicolon, JSON, XML, or tool call."
+    )
+
+
+def hint_field_user_prompt(question: str, history: str, field: str, previous_fields: list[str]) -> str:
+    if field not in HINT_FIELDS:
+        raise ValueError(f"Unknown hint field: {field}")
+    previous = "\n".join(
+        f"{name}: {value}" for name, value in zip(HINT_FIELDS, previous_fields, strict=False)
+    )
+    previous_block = f"\n\n<selected_fields>\n{previous}\n</selected_fields>" if previous else ""
+    return (
+        "<question>\n"
+        f"{question.strip()}\n"
+        "</question>\n\n"
+        "<failed_search_history>\n"
+        f"{history.strip()}\n"
+        f"</failed_search_history>{previous_block}\n\n"
+        f"Output only the {field} field."
+    )
+
+
+def hinted_query_system_prompt() -> str:
+    return (
+        "Generate one concise web-search query using the supplied three-field search direction. "
+        "Output the query only: no explanation, quotes, labels, JSON, XML, or tool-call wrapper."
+    )
+
+
+def hinted_query_user_prompt(question: str, history: str, hint: str) -> str:
+    return (
+        "<question>\n"
+        f"{question.strip()}\n"
+        "</question>\n\n"
+        "<failed_search_history>\n"
+        f"{history.strip()}\n"
+        "</failed_search_history>\n\n"
+        f"Search direction: {hint.strip()}\n\n"
+        "Produce a new query that follows this direction and does not repeat an earlier query."
+    )

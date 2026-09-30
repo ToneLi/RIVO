@@ -1,0 +1,461 @@
+"""Three-slot hint generation with a frozen Host and trainable logit correction."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
+import torch
+from torch import Tensor
+from torch.nn import functional as F
+
+from .hint_prompts import (
+    HINT_FIELDS,
+    hint_field_system_prompt,
+    hint_field_user_prompt,
+    hinted_query_system_prompt,
+    hinted_query_user_prompt,
+)
+from .policy import FrozenHostPluginPolicy, _last_hidden
+
+
+_EAST_ASIAN_RE = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+_BLOCKED_HINT_TOKENS = frozenset(
+    {
+        "i", "we", "us", "our", "user", "question", "answer", "need",
+        "analyze", "record", "tool", "tools", "searching", "reasoning",
+    }
+)
+
+
+@dataclass
+class HintSegment:
+    host_prefix_ids: list[int]
+    plugin_prefix_ids: list[int]
+    target_ids: list[int]
+    old_log_probs: list[float]
+    temperature: float
+    top_p: float
+    correction_topk: int
+
+
+@dataclass
+class HintSample:
+    fields: tuple[str, str, str]
+    segments: list[HintSegment]
+
+    @property
+    def text(self) -> str:
+        return " ; ".join(self.fields)
+
+    @property
+    def semantic_tokens(self) -> int:
+        return sum(len(segment.target_ids) for segment in self.segments)
+
+
+def _chat_ids(tokenizer, system: str, user: str) -> list[int]:
+    kwargs = {"tokenize": True, "add_generation_prompt": True, "enable_thinking": False}
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    try:
+        return list(tokenizer.apply_chat_template(messages, **kwargs))
+    except TypeError:
+        kwargs.pop("enable_thinking")
+        return list(tokenizer.apply_chat_template(messages, **kwargs))
+
+
+def _trimmed_prompt_ids(tokenizer, system: str, user_builder, history: str, max_length: int) -> list[int]:
+    char_limit = max_length * 8
+    if len(history) > char_limit:
+        history = "[Earlier failed history omitted]\n" + history[-char_limit:]
+
+    def encode(selected_history: str) -> list[int]:
+        return _chat_ids(tokenizer, system, user_builder(selected_history))
+
+    ids = encode(history)
+    if len(ids) <= max_length:
+        return ids
+    marker = "[Earlier failed history omitted]\n"
+    low, high = 0, len(history)
+    best: list[int] | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        suffix = history[-middle:] if middle else ""
+        candidate = encode(marker + suffix)
+        if len(candidate) <= max_length:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    if best is None:
+        raise ValueError("question and fixed hint prompt exceed the configured context length")
+    return best
+
+
+def build_semantic_vocab_mask(tokenizer, vocab_size: int, cache_path: Path | None = None) -> Tensor:
+    """Allow tokens containing language-bearing characters, not punctuation-only tokens."""
+    if cache_path is not None and cache_path.is_file():
+        cached = torch.load(cache_path, map_location="cpu", weights_only=True)
+        if cached.dtype == torch.bool and cached.shape == (vocab_size,):
+            return cached
+
+    special_ids = set(getattr(tokenizer, "all_special_ids", []))
+    mask = torch.zeros(vocab_size, dtype=torch.bool)
+    tokenizer_size = len(tokenizer)
+    for token_id in range(min(vocab_size, tokenizer_size)):
+        if token_id in special_ids:
+            continue
+        text = tokenizer.decode([token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        normalized = text.strip().casefold()
+        # Pure whitespace tokens are not semantic content. Allowing them here
+        # lets sampling emit spaces followed by a stop token; _clean_field then
+        # sees an empty field and used to abort the entire rollout batch.
+        if (
+            "\n" not in text
+            and "\r" not in text
+            and any(character.isalnum() for character in text)
+            and not _EAST_ASIAN_RE.search(text)
+            and normalized not in _BLOCKED_HINT_TOKENS
+        ):
+            mask[token_id] = True
+    if not bool(mask.any()):
+        raise RuntimeError("semantic vocabulary mask is empty")
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(mask, cache_path)
+    return mask
+
+
+def _single_token_ids(tokenizer, texts: Sequence[str]) -> set[int]:
+    output: set[int] = set()
+    for text in texts:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) == 1:
+            output.add(int(ids[0]))
+    return output
+
+
+def build_stop_token_ids(tokenizer) -> set[int]:
+    stop_ids = _single_token_ids(tokenizer, ("\n", "\n\n", ";", " ;"))
+    for token in ("<|endoftext|>", "<|im_end|>"):
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if isinstance(token_id, int) and token_id >= 0:
+            stop_ids.add(token_id)
+    if isinstance(tokenizer.eos_token_id, int):
+        stop_ids.add(int(tokenizer.eos_token_id))
+    return stop_ids
+
+
+def _top_p_filter(logits: Tensor, top_p: float) -> Tensor:
+    if top_p >= 1.0:
+        return logits
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+    cumulative = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+    remove = cumulative > top_p
+    remove[..., 1:] = remove[..., :-1].clone()
+    remove[..., 0] = False
+    sorted_logits = sorted_logits.masked_fill(remove, -torch.inf)
+    return torch.empty_like(logits).scatter(-1, sorted_indices, sorted_logits)
+
+
+def corrected_hint_logits(
+    policy: FrozenHostPluginPolicy,
+    host_logits: Tensor,
+    plugin_hidden: Tensor,
+    semantic_vocab_mask: Tensor,
+    correction_topk: int,
+) -> Tensor:
+    if correction_topk < 0:
+        raise ValueError("correction_topk must be non-negative")
+    semantic_mask = semantic_vocab_mask.to(device=plugin_hidden.device, dtype=torch.bool)
+    delta = policy.plugin.correction_head(plugin_hidden).float()
+    delta = delta * semantic_mask.to(delta.dtype)
+    semantic_count = int(semantic_mask.sum().item())
+    # A dense warm-up is necessary because correction_head.up starts at zero.
+    if 0 < correction_topk < semantic_count:
+        scores = delta.abs().masked_fill(~semantic_mask, -torch.inf)
+        indices = scores.topk(correction_topk, dim=-1).indices
+        selected = delta.gather(-1, indices)
+        delta = torch.zeros_like(delta).scatter(-1, indices, selected)
+    logits = host_logits.detach().to(delta.device).float() + policy.alpha * delta
+    if policy.valid_vocab_size < logits.shape[-1]:
+        logits[..., policy.valid_vocab_size :] = -torch.inf
+    return logits
+
+
+def _clean_field(text: str) -> str:
+    text = re.sub(r"</?[^>]+>", " ", text)
+    text = re.split(r"[;\r\n]", text, maxsplit=1)[0]
+    text = re.sub(r"^(?:entity|relation|disambiguator)\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = " ".join(text.strip().strip("\"'`()[]{}").split())
+    if not text or not any(character.isalnum() for character in text):
+        raise ValueError("Host generated an empty semantic hint field")
+    return text
+
+
+def _clean_query(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"</?[^>]+>", " ", text)
+    lines = [line.strip().strip("\"'") for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("Host generated an empty query from the hint")
+    query = re.sub(r"^(?:query|search query)\s*:\s*", "", lines[0], flags=re.IGNORECASE).strip()
+    if not query:
+        raise ValueError("Host generated an empty query from the hint")
+    return query[:1000]
+
+
+class HintPolicyRuntime:
+    """Generate/score structured hints while keeping all Host operations frozen."""
+
+    def __init__(
+        self,
+        policy: FrozenHostPluginPolicy,
+        host_tokenizer,
+        plugin_tokenizer,
+        *,
+        semantic_vocab_mask: Tensor,
+        max_context_length: int = 4096,
+    ) -> None:
+        self.policy = policy
+        self.host_tokenizer = host_tokenizer
+        self.plugin_tokenizer = plugin_tokenizer
+        self.plugin_device = next(policy.plugin.parameters()).device
+        self.host_device = next(policy.host.parameters()).device
+        self.device = self.plugin_device
+        self.semantic_vocab_mask = semantic_vocab_mask.to(self.plugin_device)
+        self.stop_token_ids = build_stop_token_ids(host_tokenizer)
+        self.max_context_length = max_context_length
+        if host_tokenizer.get_vocab() != plugin_tokenizer.get_vocab():
+            raise ValueError("Host and plugin token-id maps must be identical")
+
+    def _field_prefix(self, tokenizer, question: str, history: str, field: str, previous: list[str]) -> list[int]:
+        system = hint_field_system_prompt(field)
+        builder = lambda selected: hint_field_user_prompt(question, selected, field, previous)
+        return _trimmed_prompt_ids(tokenizer, system, builder, history, self.max_context_length)
+
+    @torch.no_grad()
+    def generate_field(
+        self,
+        question: str,
+        history: str,
+        field: str,
+        previous: list[str],
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        correction_topk: int,
+    ) -> tuple[str, HintSegment]:
+        host_prefix = self._field_prefix(self.host_tokenizer, question, history, field, previous)
+        plugin_prefix = self._field_prefix(self.plugin_tokenizer, question, history, field, previous)
+        host_step = torch.tensor([host_prefix], dtype=torch.long, device=self.host_device)
+        plugin_step = torch.tensor([plugin_prefix], dtype=torch.long, device=self.plugin_device)
+        host_past = None
+        plugin_past = None
+        target_ids: list[int] = []
+        old_log_probs: list[float] = []
+        semantic_mask = self.semantic_vocab_mask
+        stop_mask = torch.zeros_like(semantic_mask)
+        stop_mask[list(self.stop_token_ids)] = True
+
+        for _ in range(max_tokens):
+            host_output = self.policy.host(
+                input_ids=host_step, past_key_values=host_past, use_cache=True, return_dict=True
+            )
+            plugin_output = self.policy.plugin.backbone(
+                input_ids=plugin_step,
+                past_key_values=plugin_past,
+                output_hidden_states=True,
+                use_cache=True,
+                return_dict=True,
+            )
+            host_past = host_output.past_key_values
+            plugin_past = plugin_output.past_key_values
+            logits = corrected_hint_logits(
+                self.policy,
+                host_output.logits[:, -1],
+                _last_hidden(plugin_output)[:, -1],
+                semantic_mask,
+                correction_topk,
+            )
+            allowed = semantic_mask | (stop_mask if target_ids else torch.zeros_like(stop_mask))
+            logits = logits.masked_fill(~allowed.unsqueeze(0), -torch.inf) / temperature
+            logits = _top_p_filter(logits, top_p)
+            log_probs = F.log_softmax(logits, dim=-1)
+            token = int(torch.multinomial(log_probs.exp(), 1).item())
+            if token in self.stop_token_ids:
+                break
+            target_ids.append(token)
+            old_log_probs.append(float(log_probs[0, token].item()))
+            host_step = torch.tensor([[token]], dtype=torch.long, device=self.host_device)
+            plugin_step = torch.tensor([[token]], dtype=torch.long, device=self.plugin_device)
+
+        if not target_ids:
+            raise ValueError(f"Host generated no semantic token for {field}")
+        text = _clean_field(self.host_tokenizer.decode(target_ids, skip_special_tokens=True))
+        return text, HintSegment(
+            host_prefix,
+            plugin_prefix,
+            target_ids,
+            old_log_probs,
+            temperature,
+            top_p,
+            correction_topk,
+        )
+
+    def generate_hint(
+        self,
+        question: str,
+        history: str,
+        *,
+        slot_token_budgets: tuple[int, int, int] = (5, 6, 5),
+        temperature: float = 1.0,
+        top_p: float = 0.95,
+        correction_topk: int = 0,
+    ) -> HintSample:
+        if len(slot_token_budgets) != 3 or min(slot_token_budgets) <= 0:
+            raise ValueError("slot_token_budgets must contain three positive values")
+        fields: list[str] = []
+        segments: list[HintSegment] = []
+        for field, budget in zip(HINT_FIELDS, slot_token_budgets, strict=True):
+            text, segment = self.generate_field(
+                question,
+                history,
+                field,
+                fields,
+                max_tokens=budget,
+                temperature=temperature,
+                top_p=top_p,
+                correction_topk=correction_topk,
+            )
+            fields.append(text)
+            segments.append(segment)
+        return HintSample(tuple(fields), segments)
+
+    def supervised_field_loss(
+        self,
+        question: str,
+        history: str,
+        field: str,
+        previous: list[str],
+        target_text: str,
+        *,
+        correction_topk: int = 0,
+    ) -> tuple[Tensor, dict[str, float]]:
+        """Teacher-force one field through the exact fused-logits inference path."""
+        raw_target_ids = self.host_tokenizer.encode(target_text, add_special_tokens=False)
+        target_ids = [token_id for token_id in raw_target_ids if bool(self.semantic_vocab_mask[token_id].item())]
+        if not target_ids:
+            raise ValueError(f"Supervised {field} target has no semantic or whitespace tokens")
+        target = torch.tensor([target_ids], dtype=torch.long, device=self.plugin_device)
+
+        host_prefix_ids = self._field_prefix(self.host_tokenizer, question, history, field, previous)
+        plugin_prefix_ids = self._field_prefix(self.plugin_tokenizer, question, history, field, previous)
+        host_prefix = torch.tensor([host_prefix_ids], dtype=torch.long, device=self.host_device)
+        plugin_prefix = torch.tensor([plugin_prefix_ids], dtype=torch.long, device=self.plugin_device)
+        host_target = target.to(self.host_device)
+        with torch.no_grad():
+            host_output = self.policy.host(
+                input_ids=torch.cat((host_prefix, host_target), dim=1),
+                use_cache=False,
+                return_dict=True,
+            )
+            host_logits = host_output.logits[:, -target.shape[1] - 1 : -1]
+        plugin_output = self.policy.plugin.backbone(
+            input_ids=torch.cat((plugin_prefix, target), dim=1),
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        plugin_hidden = _last_hidden(plugin_output)[:, -target.shape[1] - 1 : -1]
+        corrected = corrected_hint_logits(
+            self.policy,
+            host_logits,
+            plugin_hidden,
+            self.semantic_vocab_mask,
+            correction_topk,
+        )
+        allowed = self.semantic_vocab_mask.view(1, 1, -1)
+        corrected = corrected.masked_fill(~allowed, -torch.inf)
+        base = host_logits.detach().to(corrected.device).float().masked_fill(~allowed, -torch.inf)
+        corrected_log_probs = F.log_softmax(corrected, dim=-1)
+        base_log_probs = F.log_softmax(base, dim=-1)
+        selected = corrected_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+        loss = -selected.mean()
+        with torch.no_grad():
+            corrected_probs = corrected_log_probs.exp()
+            metrics = {
+                "nll": float(loss.detach().item()),
+                "host_nll": float(-base_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1).mean().item()),
+                "token_accuracy": float((corrected.argmax(dim=-1) == target).float().mean().item()),
+                "host_token_accuracy": float((base.argmax(dim=-1) == target).float().mean().item()),
+                "kl_from_host": float(
+                    (corrected_probs * (corrected_log_probs - base_log_probs).masked_fill(~allowed, 0.0))
+                    .sum(dim=-1)
+                    .mean()
+                    .item()
+                ),
+                "top1_change_rate": float((corrected.argmax(dim=-1) != base.argmax(dim=-1)).float().mean().item()),
+            }
+        return loss, metrics
+
+    def score_segment(self, segment: HintSegment) -> Tensor:
+        target = torch.tensor([segment.target_ids], dtype=torch.long, device=self.plugin_device)
+        host_target = target.to(self.host_device)
+        host_prefix = torch.tensor([segment.host_prefix_ids], dtype=torch.long, device=self.host_device)
+        plugin_prefix = torch.tensor([segment.plugin_prefix_ids], dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            host_output = self.policy.host(
+                input_ids=torch.cat((host_prefix, host_target), dim=1), use_cache=False, return_dict=True
+            )
+            host_logits = host_output.logits[:, -target.shape[1] - 1 : -1]
+        plugin_output = self.policy.plugin.backbone(
+            input_ids=torch.cat((plugin_prefix, target), dim=1),
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        plugin_hidden = _last_hidden(plugin_output)[:, -target.shape[1] - 1 : -1]
+        logits = corrected_hint_logits(
+            self.policy,
+            host_logits,
+            plugin_hidden,
+            self.semantic_vocab_mask,
+            segment.correction_topk,
+        )
+        stop_mask = torch.zeros_like(self.semantic_vocab_mask)
+        stop_mask[list(self.stop_token_ids)] = True
+        allowed = self.semantic_vocab_mask.view(1, 1, -1).expand(1, target.shape[1], -1).clone()
+        if target.shape[1] > 1:
+            allowed[:, 1:, :] |= stop_mask.view(1, 1, -1)
+        logits = logits.masked_fill(~allowed, -torch.inf) / segment.temperature
+        logits = _top_p_filter(logits, segment.top_p)
+        return F.log_softmax(logits, dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)[0]
+
+    @torch.no_grad()
+    def generate_query(self, question: str, history: str, hint: str, *, max_new_tokens: int = 32) -> str:
+        system = hinted_query_system_prompt()
+        builder = lambda selected: hinted_query_user_prompt(question, selected, hint)
+        prefix = _trimmed_prompt_ids(self.host_tokenizer, system, builder, history, self.max_context_length)
+        ids = torch.tensor([prefix], dtype=torch.long, device=self.host_device)
+        eos_ids = sorted(
+            token_id
+            for token_id in (
+                self.host_tokenizer.eos_token_id,
+                self.host_tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                self.host_tokenizer.convert_tokens_to_ids("<|im_end|>"),
+            )
+            if isinstance(token_id, int) and token_id >= 0
+        )
+        generated = self.policy.host.generate(
+            ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            eos_token_id=eos_ids,
+            pad_token_id=self.host_tokenizer.eos_token_id,
+            use_cache=True,
+        )
+        raw = self.host_tokenizer.decode(generated[0, ids.shape[1] :], skip_special_tokens=True)
+        return _clean_query(raw)

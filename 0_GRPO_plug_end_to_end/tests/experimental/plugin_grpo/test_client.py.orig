@@ -1,0 +1,69 @@
+import asyncio
+import pickle
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
+from verl.experimental.agent_loop.tool_agent_loop import AgentState, DeepResearchAgentLoop
+from verl.experimental.plugin_grpo.client import PluginPolicyClient
+from verl.experimental.plugin_grpo import deepresearch_agent as agent_module
+from verl.experimental.plugin_grpo.deepresearch_agent import DeepResearchPluginAgentLoop
+
+
+def test_http_error_preserves_detail_and_is_ray_serializable():
+    async def respond(request):
+        return httpx.Response(
+            400,
+            request=request,
+            json={"detail": "Host generated an empty semantic hint field"},
+        )
+
+    async def exercise():
+        client = PluginPolicyClient("http://plugin.test")
+        await client.client.aclose()
+        client.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        try:
+            with pytest.raises(RuntimeError) as error:
+                await client.hint(
+                    trace_id="trace",
+                    group_id="group",
+                    question="question",
+                    history="history",
+                    training=True,
+                )
+            restored = pickle.loads(pickle.dumps(error.value))
+            assert str(restored) == ("Plugin service HTTP 400 on /hint: Host generated an empty semantic hint field")
+        finally:
+            await client.close()
+
+    asyncio.run(exercise())
+
+
+def test_failed_hint_is_skipped_instead_of_aborting_rollout():
+    class FailingClient:
+        async def hint(self, **kwargs):
+            del kwargs
+            raise RuntimeError("Plugin service HTTP 400 on /hint: empty field")
+
+    agent = DeepResearchPluginAgentLoop.__new__(DeepResearchPluginAgentLoop)
+    agent._plugin_client = FailingClient()
+    agent._plugin_trace_id = "trace"
+    agent._plugin_group_id = "group"
+    agent._plugin_training = True
+    agent.min_hint_round = 1
+    agent.max_hints_per_trajectory = 1
+    agent.hint_cooldown_rounds = 0
+    agent._hint_count = 0
+    agent._last_hint_round = -(10**9)
+    agent_data = SimpleNamespace(
+        messages=[{"role": "user", "content": "question"}],
+        extra_fields={},
+    )
+
+    state = asyncio.run(agent._handle_hint_policy(agent_data, round_num=8))
+
+    assert state == AgentState.GENERATING
+    assert agent_data.extra_fields["plugin_actions"][0]["action"] == "HINT_SKIPPED"
+    assert "HTTP 400" in agent_data.extra_fields["plugin_actions"][0]["hint_error"]

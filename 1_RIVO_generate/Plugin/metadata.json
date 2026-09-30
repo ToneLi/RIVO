@@ -1,0 +1,19 @@
+{
+  "host_frozen": true,
+  "host_model": "simplex-ai-inc/LiteResearcher-4B",
+  "labels": [
+    "CONTINUE",
+    "STOP",
+    "REROUTE"
+  ],
+  "step": 70,
+  "update_step": 70,
+  "policy_mode": "three_field_hint",
+  "hint_slot_token_budgets": [
+    16,
+    12,
+    12
+  ],
+  "hint_correction_topk": 128,
+  "hint_query_max_words": 24
+}

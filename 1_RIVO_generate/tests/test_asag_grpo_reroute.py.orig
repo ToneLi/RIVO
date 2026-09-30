@@ -1,0 +1,164 @@
+import copy
+import os
+import unittest
+from unittest.mock import patch
+
+from deploy_agent import _apply_grpo_corrected_reroute
+
+
+class FakeTokenizer:
+    def apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        tokenize=False,
+        add_generation_prompt=True,
+    ):
+        if messages and messages[-1].get("tool_calls"):
+            query = messages[-1]["tool_calls"][0]["function"]["arguments"]["query"]
+            return (
+                'prompt<tool_call>{"name":"browser.search",'
+                f'"arguments":{{"query":"{query}"}}}}</tool_call>'
+            )
+        return "prompt"
+
+    def encode(self, text, add_special_tokens=False):
+        return [1, 2, 3]
+
+    def decode(self, tokens, skip_special_tokens=False):
+        return "decoded"
+
+
+class FakeGenerator:
+    tokenizer = FakeTokenizer()
+
+
+class FakeBrowserPool:
+    def __init__(self, result="search evidence"):
+        self.result = result
+        self.calls = []
+
+    async def call_tool(self, qid, name, arguments):
+        self.calls.append((qid, name, copy.deepcopy(arguments)))
+        return self.result
+
+
+class FakePluginClient:
+    def __init__(self, result=None, error=None):
+        self.result = result or {
+            "query": "corrected merged logits query",
+            "token_ids": [4, 5],
+            "alpha": 1.0,
+        }
+        self.error = error
+        self.calls = []
+
+    async def reroute(self, question, messages, *, host_prefix_token_ids):
+        self.calls.append((question, copy.deepcopy(messages), host_prefix_token_ids))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class ASAGGRPORerouteTests(unittest.IsolatedAsyncioTestCase):
+    def base_arguments(self):
+        return {
+            "question": "question",
+            "qid": "qid",
+            "round_num": 12,
+            "checkpoint": {"checkpoint": 3, "reroute_prompt": "ASAG fallback"},
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "question"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "browser.search"}}],
+            "generator": FakeGenerator(),
+            "grpo_reroute_trace": [],
+            "verbose": False,
+        }
+
+    async def test_asag_trigger_uses_corrected_logits_query_and_search(self):
+        arguments = self.base_arguments()
+        browser = FakeBrowserPool()
+        plugin = FakePluginClient()
+        arguments.update(browser_pool=browser, plugin_client=plugin)
+
+        pending = await _apply_grpo_corrected_reroute(**arguments)
+
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["segment"].query, "corrected merged logits query")
+        self.assertEqual(
+            browser.calls,
+            [("qid", "search", {"query": "corrected merged logits query"})],
+        )
+        self.assertEqual(arguments["messages"][-2]["role"], "assistant")
+        self.assertEqual(
+            arguments["messages"][-2]["retrieval_control"],
+            "asag_grpo_logits_reroute",
+        )
+        self.assertEqual(arguments["messages"][-1]["role"], "tool")
+        trace = arguments["grpo_reroute_trace"][0]
+        self.assertTrue(trace["logits_applied"])
+        self.assertTrue(trace["search_success"])
+        self.assertFalse(trace["fallback_to_asag_prompt"])
+        self.assertEqual(trace["alpha"], 1.0)
+        self.assertEqual(trace["host_prefix_tokens"], 3)
+        self.assertIs(arguments["checkpoint"]["grpo_reroute"], trace)
+
+    async def test_plugin_failure_falls_back_to_original_asag_prompt(self):
+        arguments = self.base_arguments()
+        arguments.update(
+            browser_pool=FakeBrowserPool(),
+            plugin_client=FakePluginClient(error=RuntimeError("sidecar unavailable")),
+        )
+
+        pending = await _apply_grpo_corrected_reroute(**arguments)
+
+        self.assertIsNone(pending)
+        self.assertEqual(
+            arguments["messages"][-1],
+            {"role": "user", "content": "ASAG fallback"},
+        )
+        trace = arguments["grpo_reroute_trace"][0]
+        self.assertFalse(trace["logits_applied"])
+        self.assertTrue(trace["fallback_to_asag_prompt"])
+        self.assertIn("sidecar unavailable", trace["error"])
+
+    async def test_search_failure_is_recorded_before_prompt_fallback(self):
+        arguments = self.base_arguments()
+        arguments.update(
+            browser_pool=FakeBrowserPool("Error executing browser.search: failed"),
+            plugin_client=FakePluginClient(),
+        )
+
+        pending = await _apply_grpo_corrected_reroute(**arguments)
+
+        self.assertIsNone(pending)
+        self.assertEqual(arguments["messages"][-2]["role"], "tool")
+        self.assertEqual(arguments["messages"][-1]["content"], "ASAG fallback")
+        trace = arguments["grpo_reroute_trace"][0]
+        self.assertTrue(trace["logits_applied"])
+        self.assertFalse(trace["search_success"])
+        self.assertTrue(trace["fallback_to_asag_prompt"])
+
+    async def test_search_service_error_retries_then_falls_back(self):
+        arguments = self.base_arguments()
+        browser = FakeBrowserPool(
+            "Error during search for query: All strings must be XML compatible"
+        )
+        arguments.update(browser_pool=browser, plugin_client=FakePluginClient())
+
+        with patch.dict(os.environ, {"GRPO_REROUTE_SEARCH_ATTEMPTS": "2"}):
+            pending = await _apply_grpo_corrected_reroute(**arguments)
+
+        self.assertIsNone(pending)
+        self.assertEqual(len(browser.calls), 2)
+        trace = arguments["grpo_reroute_trace"][0]
+        self.assertEqual(trace["search_attempts"], 2)
+        self.assertEqual(len(trace["search_errors"]), 2)
+        self.assertFalse(trace["search_success"])
+        self.assertTrue(trace["fallback_to_asag_prompt"])
+
+
+if __name__ == "__main__":
+    unittest.main()

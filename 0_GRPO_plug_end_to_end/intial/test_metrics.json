@@ -1,0 +1,50 @@
+{
+  "samples": 2901,
+  "accuracy": 0.713891761461565,
+  "macro_precision": 0.6797313508881633,
+  "macro_recall": 0.47307737909978803,
+  "macro_f1": 0.5012601574637864,
+  "invalid_predictions": 269,
+  "per_class": {
+    "CONTINUE": {
+      "precision": 0.812972972972973,
+      "recall": 0.8191721132897604,
+      "f1": 0.8160607704829084,
+      "support": 1836
+    },
+    "STOP": {
+      "precision": 0.7262210796915167,
+      "recall": 0.576530612244898,
+      "f1": 0.6427758816837316,
+      "support": 980
+    },
+    "REROUTE": {
+      "precision": 0.5,
+      "recall": 0.023529411764705882,
+      "f1": 0.0449438202247191,
+      "support": 85
+    }
+  },
+  "confusion_matrix": {
+    "CONTINUE": {
+      "CONTINUE": 1504,
+      "STOP": 207,
+      "REROUTE": 1,
+      "__INVALID__": 124
+    },
+    "STOP": {
+      "CONTINUE": 276,
+      "STOP": 565,
+      "REROUTE": 1,
+      "__INVALID__": 138
+    },
+    "REROUTE": {
+      "CONTINUE": 70,
+      "STOP": 6,
+      "REROUTE": 2,
+      "__INVALID__": 7
+    }
+  },
+  "exact_format_rate": 0.0,
+  "predictions_path": "<prediction output path>"
+}

@@ -1,0 +1,7 @@
+--- verl/experimental/plugin_grpo/policy.py
++++ verl/experimental/plugin_grpo/policy.py
+@@ -207,3 +207,4 @@
+         self.host = host
+         self.plugin = plugin
+         self.alpha = float(alpha)
++        self.valid_vocab_size = int(valid_vocab_size or plugin.host_vocab_size)

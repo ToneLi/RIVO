@@ -1,0 +1,15 @@
+{
+  "data_path": "<external dataset path>",
+  "train_samples": 26351,
+  "test_samples": 2901,
+  "train_label_counts": {
+    "CONTINUE": 15647,
+    "REROUTE": 781,
+    "STOP": 9923
+  },
+  "test_label_counts": {
+    "CONTINUE": 1836,
+    "STOP": 980,
+    "REROUTE": 85
+  }
+}

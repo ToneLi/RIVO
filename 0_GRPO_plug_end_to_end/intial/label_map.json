@@ -1,0 +1,7 @@
+{
+  "label_id_to_name": {
+    "0": "CONTINUE",
+    "1": "STOP",
+    "2": "REROUTE"
+  }
+}

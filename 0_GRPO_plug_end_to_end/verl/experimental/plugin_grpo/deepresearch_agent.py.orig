@@ -1,0 +1,255 @@
+"""DeepResearch loop controlled and rerouted by the trainable 0.6B plugin."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from typing import Any
+from uuid import uuid4
+
+from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
+from verl.experimental.agent_loop.tool_agent_loop import (
+    AgentData,
+    AgentState,
+    DeepResearchAgentLoop,
+)
+from verl.experimental.agent_loop.tool_parser import FunctionCall
+
+from .client import PluginPolicyClient
+from .prompts import render_history
+
+logger = logging.getLogger(__name__)
+
+FINALIZE_PROMPT = (
+    "The retrieval controller selected STOP. Using the evidence already collected, "
+    "return the best-supported final answer now. Do not call another tool."
+)
+
+
+@register("deepresearch_plugin_agent")
+class DeepResearchPluginAgentLoop(DeepResearchAgentLoop):
+    """Keep Host generation frozen and train only explicit plugin actions."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        config = self.config.get("plugin_grpo", {})
+        self.plugin_url = str(config.get("url", os.environ.get("PLUGIN_GRPO_URL", "http://127.0.0.1:8010")))
+        self.plugin_timeout = float(config.get("timeout", 600.0))
+        self.min_control_round = max(
+            1,
+            int(config.get("min_control_round", os.environ.get("PLUGIN_MIN_CONTROL_ROUND", "8"))),
+        )
+        self.hint_policy_enabled = bool(config.get("hint_policy", False))
+        self.min_hint_round = max(1, int(config.get("min_hint_round", os.environ.get("PLUGIN_MIN_HINT_ROUND", "8"))))
+        self.max_hints_per_trajectory = max(
+            1, int(config.get("max_hints_per_trajectory", os.environ.get("PLUGIN_MAX_HINTS_PER_TRAJECTORY", "1")))
+        )
+        self.hint_cooldown_rounds = max(
+            0, int(config.get("hint_cooldown_rounds", os.environ.get("PLUGIN_HINT_COOLDOWN_ROUNDS", "4")))
+        )
+        self._hint_count = 0
+        self._last_hint_round = -(10**9)
+        self._plugin_client: PluginPolicyClient | None = None
+        self._plugin_trace_id = ""
+        self._plugin_group_id = ""
+        self._plugin_training = True
+
+    @staticmethod
+    def _question(messages: list[dict[str, Any]]) -> str:
+        for message in messages:
+            if message.get("role") == "user" and isinstance(message.get("content"), str):
+                question = message["content"].strip()
+                if question:
+                    return question
+        raise ValueError("DeepResearch rollout has no user question")
+
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        self._plugin_trace_id = uuid4().hex
+        self._plugin_group_id = str(kwargs.get("id", kwargs.get("qids", self._plugin_trace_id)))
+        self._plugin_training = not bool(kwargs.get("plugin_validate", False))
+        self._hint_count = 0
+        self._last_hint_round = -(10**9)
+        self._plugin_client = PluginPolicyClient(self.plugin_url, timeout=self.plugin_timeout)
+        await self._plugin_client.begin(
+            self._plugin_trace_id,
+            self._plugin_group_id,
+            self._plugin_training,
+        )
+        try:
+            output = await super().run(sampling_params, **kwargs)
+            output.extra_fields.update(
+                {
+                    "plugin_trace_id": self._plugin_trace_id,
+                    "plugin_group_id": self._plugin_group_id,
+                    "plugin_training": self._plugin_training,
+                }
+            )
+            return output
+        finally:
+            await self._plugin_client.close()
+            self._plugin_client = None
+
+    async def _append_environment_message(
+        self,
+        agent_data: AgentData,
+        message: dict[str, Any],
+    ) -> bool:
+        response_ids = await self.apply_chat_template([message], remove_system_prompt=True)
+        if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            return False
+        agent_data.messages.append(message)
+        agent_data.prompt_ids += response_ids
+        agent_data.response_mask += [0] * len(response_ids)
+        if agent_data.response_logprobs:
+            agent_data.response_logprobs += [0.0] * len(response_ids)
+        return True
+
+    async def _handle_hint_policy(self, agent_data: AgentData, round_num: int) -> AgentState:
+        if self._plugin_client is None:
+            raise RuntimeError("Plugin client was not initialized")
+        blocked = (
+            round_num < self.min_hint_round
+            or self._hint_count >= self.max_hints_per_trajectory
+            or round_num - self._last_hint_round <= self.hint_cooldown_rounds
+        )
+        if blocked:
+            agent_data.extra_fields.setdefault("plugin_actions", []).append(
+                {"round": round_num, "action": "HINT_SKIPPED"}
+            )
+            return AgentState.GENERATING
+
+        question = self._question(agent_data.messages)
+        history = render_history(agent_data.messages)
+        try:
+            hint = await self._plugin_client.hint(
+                trace_id=self._plugin_trace_id,
+                group_id=self._plugin_group_id,
+                question=question,
+                history=history,
+                training=self._plugin_training,
+            )
+            query = str(hint["query"]).strip()
+            if not query:
+                raise ValueError("Plugin returned an empty hint query")
+        except Exception as exc:
+            # A hint is an optional intervention. A malformed stochastic
+            # sample or a transient service failure must not cancel every
+            # trajectory gathered in the rollout batch.
+            error = f"{type(exc).__name__}: {exc}"
+            logger.warning("Skipping failed plugin hint at round %s: %s", round_num, error)
+            agent_data.extra_fields.setdefault("plugin_actions", []).append(
+                {"round": round_num, "action": "HINT_SKIPPED", "hint_error": error}
+            )
+            return AgentState.GENERATING
+        action_log = {
+            "round": round_num,
+            "action": "HINT",
+            "hint_fields": hint.get("fields", []),
+            "hint_text": hint.get("hint", ""),
+            "hint_query": query,
+            "hint_tokens": int(hint.get("token_count", 0)),
+            "hint_quality": hint.get("quality", {}),
+        }
+        agent_data.extra_fields.setdefault("plugin_actions", []).append(action_log)
+        call_body = {"name": "browser.search", "arguments": {"query": query}}
+        assistant_message = {
+            "role": "assistant",
+            "content": f"<tool_call>{json.dumps(call_body, ensure_ascii=False)}</tool_call>",
+        }
+        appended = await self._append_environment_message(agent_data, assistant_message)
+        if not appended:
+            return AgentState.TERMINATED
+        self._hint_count += 1
+        self._last_hint_round = round_num
+        agent_data.assistant_turns += 1
+        agent_data.tool_calls = [
+            FunctionCall(
+                name="browser.search",
+                arguments=json.dumps({"query": query}, ensure_ascii=False),
+            )
+        ]
+        return AgentState.PROCESSING_TOOLS
+
+    async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
+        next_state = await super()._handle_processing_tools_state(agent_data)
+        if next_state == AgentState.TERMINATED:
+            return next_state
+        if self._plugin_client is None:
+            raise RuntimeError("Plugin client was not initialized")
+
+        round_num = max(1, agent_data.assistant_turns)
+        if self.hint_policy_enabled:
+            return await self._handle_hint_policy(agent_data, round_num)
+        if round_num < self.min_control_round:
+            # Before any non-CONTINUE action is legal, calling the 0.6B policy
+            # only produces a forced action with log-probability zero and no
+            # useful policy gradient.
+            agent_data.extra_fields.setdefault("plugin_actions", []).append(
+                {
+                    "round": agent_data.assistant_turns,
+                    "action": "CONTINUE",
+                    "controller_skipped": True,
+                    "probabilities": {"CONTINUE": 1.0, "STOP": 0.0, "REROUTE": 0.0},
+                    "allowed": {"CONTINUE": True, "STOP": False, "REROUTE": False},
+                }
+            )
+            return AgentState.GENERATING
+
+        question = self._question(agent_data.messages)
+        history = render_history(agent_data.messages)
+        decision = await self._plugin_client.control(
+            trace_id=self._plugin_trace_id,
+            group_id=self._plugin_group_id,
+            question=question,
+            history=history,
+            round_num=round_num,
+            training=self._plugin_training,
+        )
+        action = str(decision["action"])
+        action_log = {
+            "round": agent_data.assistant_turns,
+            "action": action,
+            "probabilities": decision.get("probabilities", {}),
+            "allowed": decision.get("allowed", {}),
+        }
+        agent_data.extra_fields.setdefault("plugin_actions", []).append(action_log)
+
+        if action == "CONTINUE":
+            return AgentState.GENERATING
+
+        if action == "STOP":
+            appended = await self._append_environment_message(
+                agent_data,
+                {"role": "user", "content": FINALIZE_PROMPT},
+            )
+            return AgentState.GENERATING if appended else AgentState.TERMINATED
+
+        if action != "REROUTE":
+            raise ValueError(f"Unknown plugin controller action: {action}")
+
+        reroute = await self._plugin_client.reroute(
+            trace_id=self._plugin_trace_id,
+            group_id=self._plugin_group_id,
+            question=question,
+            history=history,
+            training=self._plugin_training,
+        )
+        query = str(reroute["query"]).strip()
+        if not query:
+            raise ValueError("Plugin returned an empty reroute query")
+        call_body = {"name": "browser.search", "arguments": {"query": query}}
+        assistant_message = {
+            "role": "assistant",
+            "content": f"<tool_call>{json.dumps(call_body, ensure_ascii=False)}</tool_call>",
+        }
+        appended = await self._append_environment_message(agent_data, assistant_message)
+        if not appended:
+            return AgentState.TERMINATED
+        agent_data.assistant_turns += 1
+        agent_data.tool_calls = [
+            FunctionCall(name="browser.search", arguments=json.dumps({"query": query}, ensure_ascii=False))
+        ]
+        action_log["reroute_query"] = query
+        action_log["reroute_tokens"] = len(reroute.get("token_ids", []))
+        return AgentState.PROCESSING_TOOLS
