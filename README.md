@@ -16,17 +16,6 @@ Question → Host reasoning and search → State decision → Continue / Stop / 
                               Host rewrites query → BrowseCore
 ```
 
-## Directory Layout
-
-| Path | Contents |
-| --- | --- |
-| `picture/main_frame.pdf` | Main framework diagram |
-| `BrowseCore/` | Built retrieval corpus, evaluation data, and Qwen3 Embedding index |
-| `0_GRPO_plug_end_to_end/` | Plugin GRPO training code, data, configuration, and launch scripts |
-| `1_RIVO_generate/` | RIVO inference, search service, Host/Plugin deployment, and evaluation |
-
-BrowseCore contains `ourdata/data/`, `corpus/data/`, and `training-indexes/qwen3-embedding-8b/`. The file `corpus/data/train-00000-of-00007.parquet` and the index `training-indexes/qwen3-embedding-8b/corpus.extra.shard1.pkl` have each been reduced to 100 records/vectors for small-scale validation.
-
 ## Plugin GRPO Training
 
 Run the commands below from the `github_load/` directory. The training scripts require a Search service at `http://127.0.0.1:8001` before training starts. Use two terminals.
