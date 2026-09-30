@@ -4,7 +4,7 @@ This directory contains the framework diagram, the BrowseCore retrieval data, th
 
 ## Main Framework
 
-![Main framework](picture/main_frame.png)
+[View the main framework diagram (PDF)](picture/main_frame.pdf)
 
 The framework combines a frozen DeepResearch Host with a trainable 0.6B Plugin. A state-guided controller uses confidence, evidence attention, and reasoning convergence signals to decide whether to continue, stop, or reroute. When rerouting is needed, the Plugin produces a structured hint and a low-rank logit correction. The Host uses that information to rewrite the search query and searches the local corpus through BrowseCore. GRPO optimizes the Plugin using task rewards.
 
