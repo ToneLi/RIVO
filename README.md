@@ -1,4 +1,4 @@
-# BrowseCore, Plugin GRPO, and RIVO
+# RIVO
 
 This directory contains the framework diagram, the BrowseCore retrieval data, the Plugin GRPO training code, and the RIVO inference and evaluation code.
 
